@@ -1,180 +1,114 @@
-import streamlit as st
-import pandas as pd
-import psycopg2
-import os
+# Lab 4 – Mecanismos de Sincronización
+**Sistemas Operativos – Universidad de Antioquia**
 
-st.set_page_config(
-    layout="wide",
-    page_title="Catálogo MUUA - Colección de Antropología"
-)
+---
 
-st.title("🏛️ Catálogo MUUA - Colección de Antropología")
+## Estructura del proyecto
 
+| Archivo | Tarea | Mecanismos usados |
+|---------|-------|-------------------|
+| `queue.c` | Cola thread-safe | mutex + 2 condvars (`hay_datos` / `hay_espacio`) + timedwait |
+| `producer_consumer.c` | Productor-Consumidor | semáforos `libres`/`listos` + 2 mutexes separados |
+| `dining_philosophers.c` | Filósofos Comensales | mutex/tenedor + semáforo `sala` + jerarquía de recursos |
 
-def get_db_url():
-    url = os.environ.get("DATABASE_URL")
-    if url:
-        return url
-    return st.secrets["database"]["url"]
+Todos los archivos incluyen **métricas en tiempo de ejecución**: tiempos de espera por hilo (promedio, mínimo, máximo), nivel del buffer y throughput.
 
+---
 
-def query_db(sql, params=None):
-    conn = psycopg2.connect(get_db_url())
-    try:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-        return pd.DataFrame(rows, columns=cols)
-    finally:
-        conn.close()
+## Compilar y ejecutar
 
+```bash
+gcc -Wall -o queue               queue.c               -lpthread
+gcc -Wall -o producer_consumer   producer_consumer.c   -lpthread
+gcc -Wall -o dining_philosophers dining_philosophers.c  -lpthread
 
-@st.cache_data(ttl=3600)
-def get_culturas():
-    df = query_db(
-        "SELECT DISTINCT cultura FROM museo_piezas "
-        "WHERE cultura IS NOT NULL AND cultura <> '' "
-        "ORDER BY cultura"
-    )
-    return df["cultura"].tolist()
+./queue
+./producer_consumer
+./dining_philosophers
+```
 
+---
 
-@st.cache_data(ttl=3600)
-def load_data(registro_filtro="", cultura_filtro=""):
-    conditions = []
-    params = []
+## Tarea 1 – Cola Thread-Safe (`queue.c`)
 
-    if registro_filtro:
-        conditions.append("numero_de_registro = %s")
-        params.append(registro_filtro)
+### Decisiones de diseño
 
-    if cultura_filtro and cultura_filtro != "Todas":
-        conditions.append("cultura = %s")
-        params.append(cultura_filtro)
+Se usaron **dos variables de condición** con nombres descriptivos en español:
+- `hay_datos`: el productor señaliza acá cuando mete un item → despierta consumidores.
+- `hay_espacio`: el consumidor señaliza acá cuando saca un item → despierta productores.
 
-    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+Para que los consumidores puedan detectar que la producción terminó sin quedarse bloqueados eternamente, `sacar()` usa `pthread_cond_timedwait` con un timeout de 100 ms en vez del `wait` clásico. Cuando expira el timeout, el hilo revisa el flag `produccion_terminada` y sale limpiamente si la cola está vacía.
 
-    sql = f"""
-        SELECT
-            numero_de_registro   AS "Número de Registro",
-            fecha_ingreso_anio   AS "Año",
-            denominacion_del_objeto AS "Denominación del Objeto",
-            cultura              AS "Cultura",
-            materiales           AS "Materiales",
-            zona_arqueologica    AS "Zona Arqueológica",
-            pais                 AS "País"
-        FROM museo_piezas
-        {where_clause}
-        ORDER BY numero_de_registro
-        LIMIT 200
-    """
+```
+Flujo productor:
+  meter(item) → lock → [wait si lleno] → escribir → signal(hay_datos) → unlock
 
-    return query_db(sql, params if params else None)
+Flujo consumidor:
+  sacar() → lock → [timedwait si vacío] → leer → signal(hay_espacio) → unlock
+```
 
+### Métricas que se miden
+- Items procesados por hilo
+- Tiempo de espera promedio, mínimo y máximo
+- Throughput global (items/segundo)
 
-# ----------------------------
-# IMÁGENES
-# ----------------------------
-def get_image(denominacion):
-    denominacion = str(denominacion).lower()
-    img_folder = "imagenes"
-    if "vasija" in denominacion:
-        return os.path.join(img_folder, "vasija.jpg")
-    if "figura" in denominacion or "estatuilla" in denominacion:
-        return os.path.join(img_folder, "figura.jpg")
-    return os.path.join(img_folder, "default.jpg")
+---
 
+## Tarea 2 – Productor-Consumidor (`producer_consumer.c`)
 
-# ----------------------------
-# FILTROS
-# ----------------------------
-registro = st.text_input("Buscar por Número de Registro:")
+### Decisiones de diseño
 
-try:
-    lista_culturas = ["Todas"] + get_culturas()
-except Exception as e:
-    st.error(f"Error al conectar con la base de datos: {e}")
-    st.stop()
+Se usan **4 semáforos** en total:
+- `libres` (init = TAM_BUFFER): cuenta los slots vacíos disponibles.
+- `listos` (init = 0): cuenta los items listos pa' consumir.
+- `mu_prod` como mutex de productores (via `pthread_mutex_t`).
+- `mu_cons` como mutex de consumidores (via `pthread_mutex_t`).
 
-cultura_sel = st.selectbox("Filtrar por Cultura", lista_culturas)
+La diferencia clave frente a la solución clásica de un mutex global: **los productores y consumidores tienen mutexes independientes**. Eso significa que un productor escribiendo y un consumidor leyendo *pueden operar en paralelo* siempre que no estén en el mismo slot, lo que en la práctica reduce la contención cuando el buffer está parcialmente lleno.
 
-# ----------------------------
-# DATA
-# ----------------------------
-try:
-    df_filtrado = load_data(
-        registro_filtro=registro.strip(),
-        cultura_filtro=cultura_sel,
-    )
-except Exception as e:
-    st.error(f"Error al cargar datos: {e}")
-    st.stop()
+```
+Productor:  usleep → sem_wait(libres) → lock(mu_prod) → escribir → unlock → sem_post(listos)
+Consumidor: sem_wait(listos) → lock(mu_cons) → leer → unlock → sem_post(libres) → usleep
+```
 
-df_filtrado = df_filtrado.reset_index(drop=True)
+### Métricas que se miden
+- Tiempo de espera en semáforos
+- Nivel del buffer al momento de cada operación (min/max/promedio)
+- Throughput global
 
+---
 
-# ----------------------------
-# TABLA
-# ----------------------------
-st.subheader("Información del Objeto")
+## Tarea 3 – Filósofos Comensales (`dining_philosophers.c`)
 
-if not df_filtrado.empty:
+### Decisiones de diseño
 
-    evento_seleccion = st.dataframe(
-        df_filtrado[[
-            "Número de Registro",
-            "Año",
-            "Denominación del Objeto",
-            "Cultura",
-            "Materiales",
-        ]],
-        use_container_width=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="tabla_museo",
-    )
+Se combinan dos técnicas para eliminar deadlock:
 
-    seleccion = evento_seleccion.selection.rows
+**1. Jerarquía de recursos (orden de adquisición):**
+Cada filósofo siempre agarra primero el tenedor de menor índice entre los dos que necesita. El filósofo 4, que normalmente agarraría [4, 0], acá agarra [0, 4] — esto rompe la espera circular.
 
-    if seleccion:
+```c
+int primero = izq < der ? izq : der;  // menor índice primero
+int segundo = izq < der ? der : izq;
+```
 
-        indice_fila = seleccion[0]
-        datos_objeto = df_filtrado.iloc[indice_fila]
+**2. Semáforo de sala (N-1 comensales):**
+El semáforo `sala` inicializado en `N-1` garantiza que máximo 4 de los 5 filósofos intenten comer simultáneamente. Esto asegura que siempre haya al menos un par de tenedores libres para que alguien pueda progresar.
 
-        st.divider()
+### Métricas que se miden
+- Tiempo de espera pa' obtener tenedores (contención real)
+- Tiempo comiendo y pensando
+- Brecha máxima entre comidas consecutivas (indicador de inanición potencial)
+- **Índice de Fairness de Jain**: mide qué tan equitativamente se repartieron las comidas entre filósofos. Un valor de 1.0 significa distribución perfecta.
 
-        col1, col2 = st.columns([1, 2])
+```
+Índice Jain = (Σxi)² / (n · Σxi²)    rango: [1/n, 1.0]
+```
 
-        with col1:
-            img_path = get_image(datos_objeto["Denominación del Objeto"])
-            if os.path.exists(img_path):
-                st.image(
-                    img_path,
-                    caption=datos_objeto["Denominación del Objeto"],
-                    use_column_width="always",
-                )
-            else:
-                st.image(
-                    "https://via.placeholder.com/300?text=Sin+Imagen",
-                    use_column_width="always",
-                )
+---
 
-        with col2:
-            st.header(f"Ficha Técnica: {datos_objeto['Número de Registro']}")
-            with st.container(border=True):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"**Denominación:** {datos_objeto['Denominación del Objeto']}")
-                    st.write(f"**Cultura:** {datos_objeto['Cultura']}")
-                    st.write(f"**Año:** {datos_objeto['Año']}")
-                with c2:
-                    st.write(f"**Materiales:** {datos_objeto['Materiales']}")
-                    st.write(f"**Zona:** {datos_objeto['Zona Arqueológica']}")
-                    st.write(f"**País:** {datos_objeto['País']}")
+## Notas generales
 
-    else:
-        st.info("💡 Haz clic en una fila para ver la ficha técnica.")
-
-else:
-    st.warning("No hay objetos que coincidan con los filtros.")
+- Todos los tiempos de espera se miden con `CLOCK_MONOTONIC` para evitar saltos por sincronización NTP.
+- Los `usleep` simulan trabajo real; en producción se eliminarían.
+- Los nombres de variables están en español para mayor claridad en el contexto del curso.
